@@ -25,6 +25,16 @@
 #define TAKE_CLAIM_ENABLE 1
 
 //
+// Lag-switch mitigation
+//
+// Freezes the local simulation while every remote peer is silent, so a player
+// pulling the plug on his own connection cannot manoeuvre while immune to
+// incoming damage.  Purely local -- it only suppresses this client's own sim
+// ticks, so it neither desyncs nor changes the wire protocol.  It does,
+// however, stall the game on ordinary packet loss too.  See LagSwitchGuard.h.
+#define LAG_SWITCH_GUARD_ENABLE 1
+
+//
 // Construction / AI behavior
 //
 #define FIXED_POSN_GUARDING_CONS_ENABLE 1
@@ -40,6 +50,26 @@
 // compile time) -- must be 1/1 here since the fix itself is off.
 #define REPAIR_RATE_FIX_REPAIR_MULTIPLIER 1
 #define REPAIR_RATE_FIX_SELFHEAL_MULTIPLIER 1
+
+//
+// COB script VM -- opcode dispatch
+//
+// See CLAUDE.md / config_escalation.h -- the splice window and every
+// hardcoded address are specific to Escalation GOLD 10.1/10.2's TotalA.exe,
+// so this stays off here unless someone re-verifies it against this config's
+// own exe.  See ai-reference/simulation-performance/COB_DISPATCH_PROJECT.md.
+#define COB_DISPATCH_TABLE_ENABLE 0
+
+//
+// BuildWeaponSlotGuard -- stockpile-weapon divide-by-zero fix + weapon-slot bounds
+// check.
+//
+// See BuildWeaponSlotGuard.h / config_escalation.h. Corrected 2026-09-14: earlier text
+// here said these addresses were Escalation-specific -- PR #26's review disproved that
+// (all six signatures match byte-for-byte on all seven shipped TotalA.exe builds, this
+// is stock TA engine code). Still off here because this project has not independently
+// re-verified that itself, not because the addresses are believed to differ.
+#define BUILD_WEAPON_SLOT_GUARD_ENABLE 0
 
 //
 // Off-map aircraft
@@ -76,6 +106,20 @@
 #define USEWHITEBOARD 1
 
 //
+// Allied build-queue overlay -- see AlliedBuildQueueSync.h, and config.h for
+// the full description.  Draws allies' queued build placements (game screen
+// while SHIFT is held with an allied builder under the cursor/camera, and the
+// megamap) and broadcasts the local player's own queue to allies on
+// CHAT_05-hijack msgId 0x60.  Off: nothing is hooked, sent, parsed or drawn,
+// and the "Show ally queues" dialog checkbox is not created.
+#define ALLIED_BUILD_QUEUE_ENABLE 0
+
+// PlayerMute: local .mute / .unmute -- see config.h.  Display-only and cannot
+// desync; both splice sites are byte-checked at static-init time and the feature
+// disables itself (logged) if the exe does not match, so it ships on every config.
+#define PLAYER_MUTE_ENABLE 1
+
+//
 // Air-unit stacking / area-damage immunity -- see AreaDamageOverflow.h.
 // Lets one explosion damage every airborne unit on a cell instead of only the one
 // holding the cell's air slot. Air-only; ground/naval splash is unchanged.
@@ -94,3 +138,27 @@
 // type on both layers, not just aircraft. Class B patch.
 #define GRID_CLAIM_TIEBREAK_ENABLE 0
 
+//
+// Percentage-based resource share thresholds -- see SharePercent.h and config.h for
+// the full description.  A `%` suffix on +setsharemetal / +setshareenergy keeps the
+// threshold tracking max storage; a plain integer is unchanged vanilla behaviour.
+// Purely local per-client state; not a Class B patch, does not require every player
+// to run the same build.  Install() byte-checks both command handlers and skips
+// installation (logged) if the exe does not match.
+#define SHARE_PERCENT_ENABLE 1
+
+// Ground-to-air Guard -- see GroundToAirGuard.h. Off: addresses verified against
+// Escalation's TotalA.exe only; staged rollout, not a belief this build differs.
+#define GROUND_TO_AIR_GUARD_ENABLE 0
+
+// VtolRepairBeamFix -- see VtolRepairBeamFix.h. Off: addresses verified against
+// Escalation's TotalA.exe only; staged rollout, not a belief this build differs.
+#define VTOL_REPAIR_BEAM_FIX_ENABLE 0
+
+// Per-player patrol reclaim thresholds (+setreclaimmetal / +setreclaimenergy) and the
+// air-constructor gate; see PatrolReclaimThreshold.h.  Local decision state only, nothing
+// replicated.  The addresses were derived from Escalation's TotalA.exe, so Install() checks
+// every patched byte against the live image and disables the module (logged, nothing patched)
+// on any mismatch -- a build whose exe differs loses the feature instead of misbehaving.
+#define PATROL_RECLAIM_THRESHOLD_ENABLE 1
+#define PATROL_RECLAIM_AIR_GATE_ENABLE 1

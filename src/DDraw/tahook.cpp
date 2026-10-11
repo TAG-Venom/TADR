@@ -19,6 +19,7 @@
 #include "unitrotate.h"
 #include "buildghost.h"
 #include "AlliedBuildQueueSync.h"
+#include "ChatLayout.h"
 
 #include "fullscreenminimap.h"
 #include "GUIExpand.h"
@@ -44,6 +45,8 @@
 #define WM_MOUSEWHEEL 522
 #define MAX_SPACING 10
 
+#if ALLIED_BUILD_QUEUE_ENABLE
+// Helpers used only by VisualizeAlliedQueuedBuilds().
 namespace
 {
 	const int kAlliedQueuedBuildRectOuterColor = 221;
@@ -90,6 +93,7 @@ namespace
 			|| IsBuilderContextUnit(GetUnitByIndex(ta, ta->MouseOverUnit)));
 	}
 }
+#endif // ALLIED_BUILD_QUEUE_ENABLE
 
 CTAHook* TAHook;
 
@@ -806,6 +810,12 @@ bool CTAHook::Message(HWND WinProcWnd, UINT Msg, WPARAM wParam, LPARAM lParam)
 				}
 				break;
 			case WM_MOUSEWHEEL:
+				// While chat scrollback is armed (compose prompt open) the
+				// wheel pages history, ahead of WheelZoom / WheelMoveMegaMap /
+				// the build-rotate gesture below. No-op when the prompt is closed.
+				if (ChatLayout::ScrollbackWheel((short)HIWORD(wParam)))
+					return true;
+
 				/*FootPrint += ((short)HIWORD(wParam))/120;
 				if(FootPrint>8)
 				FootPrint = 8;
@@ -1002,7 +1012,9 @@ void CTAHook::DrawBuildOverlays()
 			VisualizeRow();
 		}
 	}
+#if ALLIED_BUILD_QUEUE_ENABLE
 	VisualizeAlliedQueuedBuilds();
+#endif
 	VisualizeDraggingBuildRectangle();
 	VisualizeMexSnapPreview();
 
@@ -1819,6 +1831,7 @@ bool CTAHook::IsAnOrder(UnitOrdersStruct* unitOrders, UnitOrdersStruct* order)
 	return false;
 }
 
+#if ALLIED_BUILD_QUEUE_ENABLE
 void CTAHook::VisualizeAlliedQueuedBuilds()
 {
 	if (!TAdynmem || (LocalShare && LocalShare->Dialog
@@ -1932,6 +1945,7 @@ void CTAHook::VisualizeAlliedQueuedBuilds()
 		}
 	}
 }
+#endif // ALLIED_BUILD_QUEUE_ENABLE
 
 void CTAHook::VisualizeDraggingBuildRectangle()
 {

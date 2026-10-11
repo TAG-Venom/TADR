@@ -30,6 +30,135 @@
 #include <tlhelp32.h>
 
 TABugFixing * FixTABug;
+
+namespace
+{
+    // Map-selection preview fix by TAG_Venom.
+    const DWORD MapPreviewCopyCallAddr = 0x004666C0u;
+    // PUSH 0, PUSH 0, LEA EDX,[ESP+68], PUSH EDI, PUSH EDX, CALL DrawFrame.
+    const BYTE MapPreviewCopyContext[] = {
+        0x6A, 0x00, 0x6A, 0x00, 0x8D, 0x54, 0x24, 0x68, 0x57, 0x52,
+        0xE8, 0xCB, 0x18, 0x05, 0x00
+    };
+    BYTE MapPreviewCopyCallPatch[5];
+
+    static_assert(sizeof(GAFFrame) == 0x18, "Retail frame ABI");
+    static_assert(offsetof(GAFFrame, Background) == 0x08, "Retail color key ABI");
+    static_assert(offsetof(GAFFrame, PtrFrameBits) == 0x10, "Retail pixels ABI");
+    static_assert(sizeof(OFFSCREEN) == 0x30, "Retail surface ABI");
+
+    // This CALL alone is intercepted. The stock allocator leaves frame+08
+    // uninitialized; DrawFrame uses it as a color key, leaving matching pixels
+    // in the temporary image untouched. Preserve every index before stock scaling.
+    void __stdcall CopyMapPreviewFrame(OFFSCREEN* destination, GAFFrame* source,
+        int x, int y)
+    {
+        typedef void (__stdcall *DrawFrameFn)(OFFSCREEN*, GAFFrame*, int, int);
+        const DrawFrameFn original = reinterpret_cast<DrawFrameFn>(0x004B7F90u);
+        const bool expected = destination && source && destination->lpSurface &&
+            source->PtrFrameBits && x == 0 && y == 0 && source->xPosition == 0 &&
+            source->yPosition == 0 && source->Compressed == 0 && source->FramePointers == 0 &&
+            source->Width > 0 && source->Height > 0 &&
+            destination->Width == source->Width && destination->Height == source->Height &&
+            destination->lPitch >= source->Width &&
+            destination->ScreenRect.left == 0 && destination->ScreenRect.top == 0 &&
+            destination->ScreenRect.right == source->Width - 1 &&
+            destination->ScreenRect.bottom == source->Height - 1;
+        if (!expected)
+        {
+            original(destination, source, x, y);
+            return;
+        }
+
+        BYTE* output = static_cast<BYTE*>(destination->lpSurface);
+        for (int row = 0; row < source->Height; ++row)
+            std::memcpy(output + static_cast<size_t>(row) * destination->lPitch,
+                source->PtrFrameBits + static_cast<size_t>(row) * source->Width,
+                source->Width);
+    }
+
+	const DWORD AntiNukeTargetSearchAddr = 0x0049D120u;
+	const BYTE AntiNukeTargetSearchExpected[5] = { 0x8B, 0x44, 0x24, 0x08, 0x53 };
+	BYTE AntiNukeTargetSearchPatch[5];
+	const DWORD AntiNukeMinimapCoverageAdjustAddr = 0x004670C4u;
+	const BYTE AntiNukeMinimapCoverageAdjustExpected[6] = { 0x81, 0xE9, 0x00, 0x02, 0x00, 0x00 };
+	BYTE AntiNukeMinimapCoverageAdjustPatch[6] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+
+	// Mirror TA's target search at 0x0049D120, replacing only its independent
+	// X/Y bounds with a circular horizontal-distance check.
+	ProjectileStruct* __stdcall FindAntiNukeTargetCircular(UnitStruct* unit, unsigned int weaponIndex)
+	{
+		weaponIndex &= 0xFFu;
+		if (!unit || weaponIndex >= 3u)
+		{
+			return NULL;
+		}
+
+		const BYTE* unitBytes = reinterpret_cast<const BYTE*>(unit);
+		const unsigned int weaponOffset = weaponIndex * 0x1Cu;
+		if (unitBytes[weaponOffset + 0x1E] == 0)
+		{
+			return NULL;
+		}
+
+		WeaponStruct* weapon = *reinterpret_cast<WeaponStruct* const*>(unitBytes + weaponOffset + 0x10);
+		TAdynmemStruct* ta = *TAmainStruct_PtrPtr;
+		if (!weapon || !ta || !ta->Projectiles || ta->NumProjectiles <= 0)
+		{
+			return NULL;
+		}
+
+		const __int64 radius = static_cast<__int64>(weapon->coverage) << 16;
+		const __int64 radiusSquared = radius * radius;
+		const int unitX = *reinterpret_cast<const int*>(unitBytes + 0x6A);
+		const int unitMapY = *reinterpret_cast<const int*>(unitBytes + 0x72);
+
+		ProjectileStruct* projectiles = ta->Projectiles;
+		const int projectileCount = ta->NumProjectiles;
+		for (int i = 0; i < projectileCount; ++i)
+		{
+			ProjectileStruct* candidate = &projectiles[i];
+			if (candidate->myLos_PlayerID == unit->cOwnerID
+				|| !candidate->Weapon
+				|| (candidate->Weapon->WeaponTypeMask & WTM_Targetable) == 0)
+			{
+				continue;
+			}
+
+			const BYTE* candidateBytes = reinterpret_cast<const BYTE*>(candidate);
+			const __int64 dx = static_cast<__int64>(unitX)
+				- *reinterpret_cast<const int*>(candidateBytes + 0x28);
+			// The engine keeps the projectile's current 16.16 map coordinates at
+			// +0x28 and +0x30; these are the same fields used by the original search.
+			const __int64 dy = static_cast<__int64>(unitMapY)
+				- *reinterpret_cast<const int*>(candidateBytes + 0x30);
+			if (dx < -radius || dx > radius || dy < -radius || dy > radius
+				|| dx * dx + dy * dy > radiusSquared)
+			{
+				continue;
+			}
+
+			bool alreadyTargeted = false;
+			for (int j = 0; j < projectileCount; ++j)
+			{
+				ProjectileStruct* target = *reinterpret_cast<ProjectileStruct**>(
+					reinterpret_cast<BYTE*>(&projectiles[j]) + 0x56);
+				if (target == candidate)
+				{
+					alreadyTargeted = true;
+					break;
+				}
+			}
+
+			if (!alreadyTargeted)
+			{
+				return candidate;
+			}
+		}
+
+		return NULL;
+	}
+}
 ///////---------------------
 /*
 .text:004866E8 078 75 04                                                           jnz     short loc_4866EE
@@ -356,8 +485,71 @@ int __stdcall GhostComFixAssistProc(PInlineX86StackBuffer X86StrackBuffer)
 // TA natively assigns the first available ID, starting its search from 0.
 // Unfortunately if that ID was used by a recently-deceased unit, we may still receive damage packets for it.
 // So we're going to additionally require that the ID be available for at least a few seconds before making it available for recycling.
-static std::vector<int> unitIdRecycleTimestamps[10];	// The timestamp at which the ID becomes available
+//
+// Beyond that margin we hand out the slot free the LONGEST, not the lowest-numbered one: a stale
+// packet naming a recycled slot finds a live unit of the wrong TYPE, the divergence that kills
+// ReceiveWeaponFired (UnitIdentity.h), and LRU maximises the window in which it lands on an empty
+// slot instead and is discarded.
+//
+// Per player: a FIFO of freed slots holding freedAt, plus a bump pointer over never-used ones.
+// GameTime is monotonic so the queue stays sorted by age. Both ends O(1); the old lowest-free
+// search was O(nIds) per create, quadratic across a mass transfer (UNITS_GiveUnit is destroy +
+// recreate, so a '.take' of a 1000-unit army is 1000 creates).
+//
+// UNITS_CreateFromNetwork @0x4861d0 writes UnitINFOID directly and never reaches this hook, so a
+// held slot can be occupied behind our back. Every hand-out re-checks UnitID == 0 and skips; a
+// skipped slot rejoins the FIFO when its unit dies.
 static const int RECYCLE_MARGIN_TIME = 5 * 30;			// 5 sec
+
+// Why holding a slot longer helps: Send_UnitStatAndMove_2C @0x0048B710 advertises
+// Units_Begin + (GameTime % Skim) each tick, an empty slot as typeID 0; then
+// UnitMove_DeserializeAndUpdate @0x0048B3F0 sets PENDING_DEATH at 0x0048B42C and
+// AutoHealAndAimLoop @0x0048AFB9 reaps it. One sweep clears a ghost.
+
+struct UnitIdFreeList
+{
+	struct Entry
+	{
+		unsigned short slot;
+		int freedAt;    // GameTime the slot was released; both age tests derive from this
+	};
+
+	std::vector<Entry> ring;
+	unsigned head = 0;			// oldest entry
+	unsigned count = 0;
+	unsigned bumpNext = 0;		// slots [bumpNext, ring.size()) have never been handed out
+
+	void Reset(unsigned nIds)
+	{
+		ring.assign(nIds, Entry{ 0, 0 });
+		head = 0;
+		count = 0;
+		bumpNext = 0;
+	}
+
+	void Push(unsigned short slot, int freedAt)
+	{
+		// One push per free (UNITS_ReceiveUnitDeath bails on an already-dead unit at 0x486706),
+		// and a slot is popped before it can be freed again, so the ring cannot overflow.
+		if (ring.empty() || count >= ring.size()) {
+			return;
+		}
+		ring[(head + count) % ring.size()] = Entry{ slot, freedAt };
+		++count;
+	}
+};
+
+static UnitIdFreeList unitIdFreeList[10];
+
+static void UnitIdFreeList_SyncSize(const TAdynmemStruct* taPtr)
+{
+	const unsigned nIds = taPtr->PlayerUnitsNumber_Skim;
+	for (int i = 0; i < 10; ++i) {
+		if (taPtr->GameTime == 0 || unitIdFreeList[i].ring.size() != nIds) {
+			unitIdFreeList[i].Reset(nIds);
+		}
+	}
+}
 
 unsigned int FixFactoryExplosionsAssignUnitIdAddr = 0x486036;
 int __stdcall FixFactoryExplosionsAssignUnitIdProc(PInlineX86StackBuffer X86StrackBuffer)
@@ -368,13 +560,8 @@ int __stdcall FixFactoryExplosionsAssignUnitIdProc(PInlineX86StackBuffer X86Stra
 	int playerIndex = *(int*)(X86StrackBuffer->Esp + 0x14 - 4) / 0x14b;
 	int unitIndexRequested = X86StrackBuffer->Edx;
 
-	unsigned nIds = taPtr->PlayerUnitsNumber_Skim;
-	for (int i = 0; i < 10; ++i) {
-		if (taPtr->GameTime == 0 || unitIdRecycleTimestamps[i].size() < nIds) {
-			unitIdRecycleTimestamps[i].clear();
-			unitIdRecycleTimestamps[i].resize(nIds, 0);		// all IDs available since t=0
-		}
-	}
+	UnitIdFreeList_SyncSize(taPtr);
+	const unsigned nIds = taPtr->PlayerUnitsNumber_Skim;
 
 	PlayerStruct* player = &taPtr->Players[playerIndex];
 	UnitStruct* units = (UnitStruct*)X86StrackBuffer->Esi;
@@ -391,13 +578,50 @@ int __stdcall FixFactoryExplosionsAssignUnitIdProc(PInlineX86StackBuffer X86Stra
 		}
 	}
 
-	for (int n = 0; n < taPtr->PlayerUnitsNumber_Skim; ++n) {
-		if (0 == player->Units[n].UnitID && taPtr->GameTime >= unitIdRecycleTimestamps[playerIndex][n]) {
-			//IDDrawSurface::OutptFmtTxt("[FixFactoryExplosionsAssignUnitIdProc] player=%d, assignedId=%d\n", playerIndex, n);
-			X86StrackBuffer->Esi = (DWORD)&player->Units[n];
-			X86StrackBuffer->rtnAddr_Pvoid = (LPVOID)0x48605d;
-			return X86STRACKBUFFERCHANGE;
+	int assigned = -1;
+	if (unsigned(playerIndex) >= 10) {
+		// Shouldn't happen; fall back to stock lowest-free rather than refuse to create.
+		for (unsigned n = 0; n < nIds; ++n) {
+			if (0 == player->Units[n].UnitID) {
+				assigned = int(n);
+				break;
+			}
 		}
+	}
+	else {
+		UnitIdFreeList& freeList = unitIdFreeList[playerIndex];
+
+		// Prefer a slot that has never been handed out: no stale packet can name it at all.
+		while (assigned < 0 && freeList.bumpNext < nIds) {
+			const unsigned n = freeList.bumpNext++;
+			if (0 == player->Units[n].UnitID) {
+				assigned = int(n);
+			}
+		}
+
+		// Oldest-first, one age gate; the queue is sorted by age so "the front is too young"
+		// proves none qualify. Nothing old enough => "no ids available", as stock TA did.
+		//
+		// A stricter 2*Skim gate was tried and removed as dead code: FIFO considers the oldest
+		// first whatever the threshold, so it can never pick a different slot than this one does.
+		while (assigned < 0 && freeList.count > 0) {
+			const UnitIdFreeList::Entry entry = freeList.ring[freeList.head];
+			if (taPtr->GameTime - entry.freedAt < RECYCLE_MARGIN_TIME) {
+				break;
+			}
+			freeList.head = (freeList.head + 1) % freeList.ring.size();
+			--freeList.count;
+			if (0 == player->Units[entry.slot].UnitID) {
+				assigned = entry.slot;
+			}
+		}
+	}
+
+	if (assigned >= 0) {
+		//IDDrawSurface::OutptFmtTxt("[FixFactoryExplosionsAssignUnitIdProc] player=%d, assignedId=%d\n", playerIndex, assigned);
+		X86StrackBuffer->Esi = (DWORD)&player->Units[assigned];
+		X86StrackBuffer->rtnAddr_Pvoid = (LPVOID)0x48605d;
+		return X86STRACKBUFFERCHANGE;
 	}
 
 	// no UnitIds available
@@ -414,14 +638,8 @@ int __stdcall FixFactoryExplosionsRecycleUnitIdProc(PInlineX86StackBuffer X86Str
 	UnitStruct* unit = (UnitStruct*)(X86StrackBuffer->Esi);
 	char* packetData = *(char**)(X86StrackBuffer->Esp + 0x7c);
 	int unitInGameIndex = *(unsigned short*)(packetData + 1);
-	
-	unsigned nIds = taPtr->PlayerUnitsNumber_Skim;
-	for (int i = 0; i < 10; ++i) {
-		if (taPtr->GameTime == 0 || unitIdRecycleTimestamps[i].size() < nIds) {
-			unitIdRecycleTimestamps[i].clear();
-			unitIdRecycleTimestamps[i].resize(nIds, 0);		// all IDs available since t=0
-		}
-	}
+
+	UnitIdFreeList_SyncSize(taPtr);
 
 	if (!unit) {
 		IDDrawSurface::OutptTxt("[FixFactoryExplosionsRecycleUnitIdProc] null unit!\n");
@@ -443,9 +661,8 @@ int __stdcall FixFactoryExplosionsRecycleUnitIdProc(PInlineX86StackBuffer X86Str
 				unit->UnitInGameIndex, unit->Owner_PlayerPtr0->UnitsIndex_Begin, taPtr->PlayerUnitsNumber_Skim);
 		}
 		else {
-			unitIdRecycleTimestamps[unit->OwnerIndex][playerUnitIndex] = taPtr->GameTime + RECYCLE_MARGIN_TIME;
-			//IDDrawSurface::OutptFmtTxt("[FixFactoryExplosionsRecycleUnitIdProc] player=%d, UnitId=%d, timestampWhenAvailable=%d\n",
-			//	int(unit->OwnerIndex), playerUnitIndex, unitIdRecycleTimestamps[unit->OwnerIndex][playerUnitIndex]);
+			// Store when it was freed, not a deadline, so the age test lives with the allocator.
+			unitIdFreeList[unit->OwnerIndex].Push((unsigned short)playerUnitIndex, taPtr->GameTime);
 		}
 	}
 	return 0;
@@ -947,6 +1164,290 @@ int __stdcall CrashFix004cbed5Proc(PInlineX86StackBuffer X)
 }
 
 // ============================================================================
+// Order-state-machine dispatch guard.
+//
+// MainOrderStateController (0x0043B7C0) and BackgroundOrderStateController
+// (0x0043BAD0) dispatch a unit's current order through
+//
+//     CALL dword ptr [g_COBTable + order->COBHandler_index * 0x19 + 4]
+//
+// with NO bounds check against g_COBTable_end (0x00512348). COBHandler_index is
+// a raw byte, so any recycled / half-freed OrderStruct drives an indirect call
+// through whatever lies past the end of the table. Diagnosed from game 189724
+// (ProTA 4.9test2, 2026-08-31): EIP ended up on dynmem+0x14353 -- a data address
+// -- out of MainOrderStateController, with an empty breadcrumb ring because
+// nothing on the order path recorded anything.
+//
+// We hook the instruction that loads the table base (BEFORE the three argument
+// pushes), so ESP is still exactly at the post-prologue level. That makes a
+// clean bail-out possible: jumping to the function's own epilogue unwinds the
+// frame correctly.
+//
+//   site 0x0043B865  MOV ECX,[0x00512344]  (6 bytes)  -> epilogue 0x0043BA9C
+//                    ESI=OrderStruct*, unit at [Esp+0x18]   (5 POPs + RET 4)
+//   site 0x0043BB0F  MOV EDX,[0x00512344]  (6 bytes)  -> epilogue 0x0043BC57
+//                    ESI=OrderStruct*, EDI=UnitStruct*      (4 POPs + RET 4)
+//   site 0x0043A202  MOV ECX,[0x00512344]  (6 bytes)  -> resume 0x0043A21E
+//                    ESI=OrderStruct*, unit at ESI->Unit_ptr
+//
+// The third site (added 2026-09-15) is UnitScriptingData_CancelOrder's teardown
+// dispatch -- the one that re-entered Order_MobileBuild in the 2026-09-14 "venom"
+// crash. Without it a re-entrant dispatch appeared as an MBRE breadcrumb with no
+// matching "Order dispatch" row, which reads like the two views disagree.
+//
+// Two things differ from the other sites. Its bail-out is not the epilogue: the
+// call here is one optional notification (condition_mask bit 1), so resuming at
+// 0x0043A21E leaves the rest of the cancel to run. ESP matches at both addresses
+// (the argument pushes are balanced by the handler's RET 0xC). And it does NOT
+// stamp g_currentOrderUnit -- it runs nested inside another unit's live handler,
+// so stamping would mis-attribute that unit's nanolathe for the rest of the
+// outer dispatch.
+//
+// DEFAULT IS OBSERVE-ONLY -- WE WANT THE CRASH.
+// Bailing out would work (the epilogue targets above unwind cleanly, and this
+// path writes nothing to game state so there is no new desync surface), but a
+// client that survives never produces an ErrorLog and nobody ever sends the
+// report in. No crash, no report, no diagnosis. So while we are still hunting
+// this bug the guard records everything and then lets the dispatch proceed
+// exactly as before, i.e. straight into the crash -- which now arrives with the
+// offending order named in the report's "Order dispatch" section and the
+// preceding KICK / MBRE breadcrumbs still in the ring.
+//
+// Flip TDRAW_ORDER_DISPATCH_BAILOUT to 1 once the cause is understood and the
+// goal changes from "diagnose" to "protect players". Compile-time only, per the
+// no-runtime-switches-on-sim-features rule: a mixed fleet where some clients
+// bail and others don't is exactly the kind of divergence that rule exists to
+// prevent.
+// ============================================================================
+
+#define TDRAW_ORDER_DISPATCH_BAILOUT 0
+
+static const unsigned OrderDispatchGuardMainAddr       = 0x0043b865;
+static const unsigned OrderDispatchGuardMainBailout    = 0x0043ba9c;
+static const unsigned OrderDispatchGuardBgAddr         = 0x0043bb0f;
+static const unsigned OrderDispatchGuardBgBailout      = 0x0043bc57;
+// "Bailout" here means "skip the notification call", not "unwind the function".
+static const unsigned OrderDispatchGuardTeardownAddr   = 0x0043a202;
+static const unsigned OrderDispatchGuardTeardownSkip   = 0x0043a21e;
+
+// Last few dispatches, kept OUTSIDE the breadcrumb ring on purpose: this path
+// runs once per order per unit per tick (~10k/s in a big game), which would
+// flush the 128-entry ring in a few milliseconds and bury every rare event.
+// A tiny dedicated ring costs 6 stores and gives the crash report the one thing
+// it most needs -- the order that was being dispatched when we died.
+struct OrderDispatchNote
+{
+	DWORD unit, order, idx, count, handler, tick;
+	const char* which;
+};
+static const int ORDER_DISPATCH_NOTES = 4;
+static OrderDispatchNote g_orderDispatchNotes[ORDER_DISPATCH_NOTES];
+static volatile LONG     g_orderDispatchHead = 0;
+static DWORD             g_orderDispatchRejects = 0;
+
+// A permanently-corrupt order would otherwise re-reject every tick forever.
+// Breadcrumbs are cheap and always recorded; only the tdrawlog line is throttled.
+static bool OrderDispatchShouldLog(DWORD n)
+{
+	return n <= 20 || (n % 1000) == 0;
+}
+
+// TotalA.exe code range -- a handler_fn outside this is garbage even when the
+// index happens to fall inside the table (the recycled-table case).
+static const DWORD kTaCodeLo = 0x00401000u;
+static const DWORD kTaCodeHi = 0x004fc000u;
+
+// Published for TeamColorNanolathe: during order dispatch the unit whose handler is running is
+// the one emitting nanolathe particles, so it can be used directly instead of scanning the whole
+// unit array for the nearest unit to the emission point. Stamped with GameTime so a consumer can
+// reject it outside the dispatch window rather than reading a stale unit.
+DWORD g_currentOrderUnit = 0;
+int   g_currentOrderUnitTick = -1;
+
+static int OrderDispatchGuardCommon(PInlineX86StackBuffer buf, DWORD unit,
+                                    unsigned bailout, const char* which)
+{
+	UnitOrdersStruct* order = (UnitOrdersStruct*)buf->Esi;
+
+	// The order pointer itself can already be freed memory. Probe only the 5
+	// bytes we are about to read (through COBHandler_index at +4) -- this runs
+	// once per order per unit per tick, and SafeIsBadReadPtr is a byte-at-a-time
+	// volatile loop, so probing the whole 0x56-byte struct here would cost ~17x
+	// more for no benefit. The reject path re-probes in full before it logs the
+	// deeper fields.
+	const bool readable = order && !SafeIsBadReadPtr(order, 5);
+
+	unsigned idx = 0xFFFFFFFFu, count = 0;
+	DWORD handler = 0;
+	if (readable)
+	{
+		const BYTE* begin = (const BYTE*)*COBSciptHandler_Begin;
+		const BYTE* end   = (const BYTE*)*COBSciptHandler_End;
+		// sizeof(COBHandle) is 0x19 -- tamem.h is inside #pragma pack(1). Spelled
+		// out so a stray packing change can't silently re-scale the stride.
+		const unsigned kStride = 0x19u;
+		count = (begin && end && end > begin) ? (unsigned)((end - begin) / kStride) : 0;
+		idx   = order->COBHandler_index;
+		if (idx < count)
+			handler = *(const DWORD*)(begin + idx * kStride + 4);  // COBHandle::orderFunctionPointer
+	}
+
+	// Record the note for EVERY dispatch, good or bad. The whole point of this
+	// snapshot is to survive into the crash report, and the dispatch we care
+	// about most is the one that is about to kill us -- so it must be the
+	// newest entry, not squeezed out by the reject path returning early.
+	LONG slot = InterlockedIncrement(&g_orderDispatchHead) - 1;
+	OrderDispatchNote& n = g_orderDispatchNotes[slot & (ORDER_DISPATCH_NOTES - 1)];
+	n.unit = unit; n.order = (DWORD)order; n.idx = idx; n.count = count;
+	n.handler = handler; n.which = which;
+	TAdynmemStruct* ta = *(TAdynmemStruct**)0x00511de8;
+	n.tick = ta ? (DWORD)ta->GameTime : 0;
+
+	if (readable && idx < count && handler >= kTaCodeLo && handler < kTaCodeHi)
+		return 0;                       // normal case: let the dispatch proceed
+
+	++g_orderDispatchRejects;
+	CrashTrace_RecordEvent(TRACE_CAT_OBAD, unit, (DWORD)order,
+		readable ? (idx | (count << 16)) : 0xFFFFFFFFu, handler);
+	if (OrderDispatchShouldLog(g_orderDispatchRejects))
+	{
+		// Only the first 5 bytes are known-readable, and maybe not even those.
+		bool deep = readable && !SafeIsBadReadPtr(order, sizeof(UnitOrdersStruct));
+		IDDrawSurface::OutptFmtTxt(
+			"[OrderDispatchGuard] %s: BAD dispatch unit=%08X order=%08X readable=%d "
+			"COBHandler_index=%d (table has %u) handler=%08X state=%d orderState=%08X "
+			"next=%08X tick=%lu (#%u)",
+			which, unit, (DWORD)order, (int)readable,
+			readable ? (int)idx : -1, count, handler,
+			readable ? (int)order->State : -1,
+			deep ? order->Order_State : 0xBADBAD00u,
+			deep ? (DWORD)order->NextOrder : 0xBADBAD00u,
+			(unsigned long)n.tick, g_orderDispatchRejects);
+	}
+
+#if TDRAW_ORDER_DISPATCH_BAILOUT
+	// Survive instead of crashing: unwind via the function's own epilogue,
+	// costing one tick of this unit's order processing. Verified stack-correct
+	// (ESP is still at post-prologue level at the hook site), but OFF by default
+	// -- see the comment block above for why.
+	buf->rtnAddr_Pvoid = (LPVOID)bailout;
+	return X86STRACKBUFFERCHANGE;
+#else
+	(void)bailout;
+	return 0;
+#endif
+}
+
+// Only the two top-level controllers publish the current unit; the teardown site
+// is nested inside one of them and must not overwrite the stamp.
+static void StampCurrentOrderUnit(DWORD unit)
+{
+	const TAdynmemStruct* ta = *(TAdynmemStruct**)0x00511de8;
+	g_currentOrderUnit = unit;
+	g_currentOrderUnitTick = ta ? ta->GameTime : -1;
+}
+
+int __stdcall OrderDispatchGuardMainProc(PInlineX86StackBuffer buf)
+{
+	// MainOrderStateController: unit_ptr is the stdcall arg at [Esp+0x18]
+	// (5 pushed regs + return address below it).
+	const DWORD* stackTop = (const DWORD*)buf->Esp;
+	DWORD unit = (stackTop && !SafeIsBadReadPtr(stackTop, 0x1c)) ? stackTop[6] : 0;
+	StampCurrentOrderUnit(unit);
+	return OrderDispatchGuardCommon(buf, unit, OrderDispatchGuardMainBailout, "main");
+}
+
+int __stdcall OrderDispatchGuardBgProc(PInlineX86StackBuffer buf)
+{
+	// BackgroundOrderStateController keeps unit_ptr in EDI across the loop.
+	StampCurrentOrderUnit(buf->Edi);
+	return OrderDispatchGuardCommon(buf, buf->Edi, OrderDispatchGuardBgBailout, "background");
+}
+
+int __stdcall OrderDispatchGuardTeardownProc(PInlineX86StackBuffer buf)
+{
+	// __fastcall, order in ESI since 0x0043A1F2; the unit is order->Unit_ptr, the
+	// same value the engine pushes at 0x0043A219. Probe first -- this whole guard
+	// exists because the order can be freed memory.
+	const UnitOrdersStruct* order = (const UnitOrdersStruct*)buf->Esi;
+	DWORD unit = (order && !SafeIsBadReadPtr(order, 0x12)) ? (DWORD)order->Unit_ptr : 0;
+	return OrderDispatchGuardCommon(buf, unit, OrderDispatchGuardTeardownSkip, "teardown");
+}
+
+// ============================================================================
+// Sound instance limiting -- see config.h for why and the measurements behind it.
+// ============================================================================
+#if SOUND_INSTANCE_LIMIT_MS > 0
+
+static const unsigned kSoundSlots = 512;          // power of two
+struct SoundStamp { DWORD key; DWORD ms; };
+static SoundStamp g_playStamp[kSoundSlots];
+static unsigned g_sndPlayed = 0, g_sndDropped = 0;
+static DWORD g_sndLogMs = 0;
+
+static inline unsigned SoundSlot(DWORD key)
+{
+	key ^= key >> 16; key *= 0x7FEB352Du; key ^= key >> 15;
+	return key & (kSoundSlots - 1);
+}
+
+// True when this key already fired inside the window, i.e. the caller should suppress.
+// Direct-mapped: a colliding key simply refreshes the slot, so the worst case is a missed
+// suppression, never a wrongly suppressed sound.
+static bool SoundFiredRecently(SoundStamp* table, DWORD key, DWORD windowMs, DWORD now)
+{
+	SoundStamp& s = table[SoundSlot(key)];
+	if (s.key == key && (now - s.ms) < windowMs)
+		return true;
+	s.key = key;
+	s.ms = now;
+	return false;
+}
+
+static void SoundLimitHeartbeat(DWORD now)
+{
+	if (now - g_sndLogMs < 30000u)
+		return;
+	g_sndLogMs = now;
+	const unsigned play = g_sndPlayed + g_sndDropped;
+	IDDrawSurface::OutptFmtTxt(
+		"[SoundLimit] played=%u dropped=%u (%u%% dropped)",
+		g_sndPlayed, g_sndDropped, play ? (g_sndDropped * 100u / play) : 0u);
+}
+#endif
+
+#if SOUND_INSTANCE_LIMIT_MS > 0
+// Hooked just past DSoundP_PlayBuffer's prologue (SUB ESP,0x1C + 4 pushes), so the suppress path
+// can jump to the function's own early return at 0x004CF5D7 rather than doing stack surgery.
+// The two stolen instructions are local-variable stores the early-return path never reads.
+// arg1 is SoundEffectsArray[soundId] -- a stable per-sound object, verified in Ghidra at
+// 0047F367 (MOV EBX,[EAX+ECX*4+0x33A13]), so it keys the cooldown correctly.
+static const unsigned SoundPlayHookAddr  = 0x004cf582;
+static const unsigned SoundPlayHookLen   = 8;          // resumes at 0x004CF58A
+static const unsigned SoundPlayEarlyRet  = 0x004cf5d7; // XOR EAX,EAX; POP x4; ADD ESP,0x1C; RET 0xC
+static const unsigned char SoundPlayBytes[8] = { 0x89, 0x74, 0x24, 0x18, 0x89, 0x6C, 0x24, 0x10 };
+
+int __stdcall SoundInstanceLimitProc(PInlineX86StackBuffer buf)
+{
+	// SUB ESP,0x1C then 4 pushes => the caller's arguments start at Esp+0x30.
+	const DWORD* args = (const DWORD*)(buf->Esp + 0x30);
+	const DWORD soundObj = args[0];
+	const DWORD now = GetTickCount();
+
+	if (soundObj && SoundFiredRecently(g_playStamp, soundObj, SOUND_INSTANCE_LIMIT_MS, now))
+	{
+		++g_sndDropped;
+		buf->rtnAddr_Pvoid = (LPVOID)SoundPlayEarlyRet;
+		return X86STRACKBUFFERCHANGE;
+	}
+	++g_sndPlayed;
+	SoundLimitHeartbeat(now);
+	return 0;
+}
+#endif
+
+
+// ============================================================================
 // Generic crash report — fires for ANY fatal exception that the address-specific
 // handlers above don't claim. Captures registers, bytes@EIP, the faulting-memory
 // window, an EBP stack walk + raw stack attributed to modules, a TA game-state
@@ -1224,6 +1725,29 @@ static void WriteGameStateSnapshot(FILE* f)
 	}
 }
 
+// The order that was being dispatched when we died. Kept separate from the
+// breadcrumb ring because this path is far too hot to breadcrumb (see the
+// OrderDispatchGuard comment block).
+static void WriteOrderDispatch(FILE* f)
+{
+	fprintf(f, "--- Order dispatch (last %d, newest first; %u flagged bad this run) ---\n",
+		ORDER_DISPATCH_NOTES, g_orderDispatchRejects);
+	LONG head = g_orderDispatchHead;
+	bool any = false;
+	for (int i = 1; i <= ORDER_DISPATCH_NOTES; ++i)
+	{
+		const OrderDispatchNote& n = g_orderDispatchNotes[(head - i) & (ORDER_DISPATCH_NOTES - 1)];
+		if (!n.order) continue;
+		any = true;
+		fprintf(f, "  %-10s tick=%-8lu unit=%08X order=%08X idx=%-4d/%-4u handler=%08X%s\n",
+			n.which ? n.which : "?", (unsigned long)n.tick,
+			n.unit, n.order, (int)n.idx, n.count, n.handler,
+			(n.idx == 0xFFFFFFFFu || n.idx >= n.count ||
+			 n.handler < kTaCodeLo || n.handler >= kTaCodeHi) ? "   <== BAD" : "");
+	}
+	if (!any) fprintf(f, "(none)\n");
+}
+
 static void WriteTraceRing(FILE* f)
 {
 	fprintf(f, "--- Breadcrumb ring (last %d events, oldest first) ---\n", TRACE_RING_SIZE);
@@ -1293,6 +1817,7 @@ static void WriteGenericCrashReport(FILE* f, PEXCEPTION_POINTERS ei)
 	WriteStackWalk(f, ctx->Ebp, mods, nmods);
 	WriteRawStack(f, ctx->Esp, mods, nmods, 32);
 	WriteGameStateSnapshot(f);
+	WriteOrderDispatch(f);
 	WriteTraceRing(f);
 
 	fprintf(f, "--- modules ---\n");
@@ -1900,6 +2425,16 @@ static int __stdcall ReserveLoopingSoundSlotProc(PInlineX86StackBuffer X86Strack
 TABugFixing::TABugFixing ()
 {
 
+    if (memcmp(reinterpret_cast<const void*>(MapPreviewCopyCallAddr - 10u),
+        MapPreviewCopyContext, sizeof(MapPreviewCopyContext)) == 0)
+    {
+        MapPreviewCopyCallPatch[0] = 0xE8;
+        *reinterpret_cast<DWORD*>(MapPreviewCopyCallPatch + 1) =
+            reinterpret_cast<DWORD>(&CopyMapPreviewFrame) - (MapPreviewCopyCallAddr + 5u);
+        m_hooks.push_back(std::make_unique<SingleHook>(MapPreviewCopyCallAddr,
+            sizeof(MapPreviewCopyCallPatch), INLINE_UNPROTECTEVINMENT, MapPreviewCopyCallPatch));
+    }
+
 	MaxUnitID= 0;
 	// Unlimited mixing deliberately allows untracked one-shots, but a looping
 	// sound needs a tracked slot so TA's stop-all can find it. The old hook at
@@ -2026,7 +2561,61 @@ TABugFixing::TABugFixing ()
 	FixFactoryExplosionsRecycleUnitId.reset(new InlineSingleHook(FixFactoryExplosionsRecycleUnitIdAddr, 5, INLINE_5BYTESLAGGERJMP, FixFactoryExplosionsRecycleUnitIdProc));
 	HostDoesntLeave.reset(new InlineSingleHook(PutDeadHostInWatchModeAddr, 5, INLINE_5BYTESLAGGERJMP, PutDeadHostInWatchModeProc));
 	JunkYardmapFix.reset(new InlineSingleHook(JunkYardmapFixAddr, 5, INLINE_5BYTESLAGGERJMP, JunkYardmapFixProc));
+	// 6 bytes each: MOV ECX/EDX,[0x00512344] -- a whole instruction, and it sits
+	// before the dispatch's argument pushes so the bail-out is stack-correct.
+	OrderDispatchGuardMain.reset(new InlineSingleHook(
+		OrderDispatchGuardMainAddr, 6, INLINE_5BYTESLAGGERJMP, OrderDispatchGuardMainProc));
+	OrderDispatchGuardBackground.reset(new InlineSingleHook(
+		OrderDispatchGuardBgAddr, 6, INLINE_5BYTESLAGGERJMP, OrderDispatchGuardBgProc));
+	// Same 6-byte MOV ECX,[0x00512344]; nothing branches into those bytes (the
+	// JZ at 0x0043A200 targets 0x0043A21E, past the end of the patch).
+	OrderDispatchGuardTeardown.reset(new InlineSingleHook(
+		OrderDispatchGuardTeardownAddr, 6, INLINE_5BYTESLAGGERJMP, OrderDispatchGuardTeardownProc));
+#if SOUND_INSTANCE_LIMIT_MS > 0
+	if (memcmp((const void*)SoundPlayHookAddr, SoundPlayBytes, SoundPlayHookLen) == 0)
+	{
+		SoundInstanceLimit.reset(new InlineSingleHook(
+			SoundPlayHookAddr, SoundPlayHookLen, INLINE_5BYTESLAGGERJMP, SoundInstanceLimitProc));
+	}
+	else
+	{
+		IDDrawSurface::OutptFmtTxt("[SoundLimit] SKIPPED play hook: bytes at 0x%08X not stock", SoundPlayHookAddr);
+	}
+#endif
+#if SOUND_INSTANCE_LIMIT_MS > 0
+	IDDrawSurface::OutptFmtTxt("[SoundLimit] installed: playback=%dms", SOUND_INSTANCE_LIMIT_MS);
+#endif
+
+	IDDrawSurface::OutptFmtTxt(
+		"[OrderDispatchGuard] installed at 0x%08X (main), 0x%08X (background) and "
+		"0x%08X (teardown): COBHandler_index + handler_fn checked, OBSERVE-ONLY (bailout=%d)",
+		OrderDispatchGuardMainAddr, OrderDispatchGuardBgAddr, OrderDispatchGuardTeardownAddr,
+		TDRAW_ORDER_DISPATCH_BAILOUT);
 	CanBuildArrayBufferOverrunFix.reset(new SingleHook(CanBuildArrayBufferOverrunFixAddr, sizeof(CanBuildArrayBufferOverrunFixBytes), INLINE_UNPROTECTEVINMENT, CanBuildArrayBufferOverrunFixBytes));
+	if (memcmp(reinterpret_cast<const void*>(AntiNukeTargetSearchAddr),
+		AntiNukeTargetSearchExpected, sizeof(AntiNukeTargetSearchExpected)) == 0)
+	{
+		AntiNukeTargetSearchPatch[0] = 0xE9;
+		*reinterpret_cast<DWORD*>(AntiNukeTargetSearchPatch + 1) =
+			reinterpret_cast<DWORD>(&FindAntiNukeTargetCircular) - (AntiNukeTargetSearchAddr + 5u);
+		m_hooks.push_back(std::make_unique<SingleHook>(AntiNukeTargetSearchAddr,
+			sizeof(AntiNukeTargetSearchPatch), INLINE_UNPROTECTEVINMENT, AntiNukeTargetSearchPatch));
+	}
+	else
+	{
+		IDDrawSurface::OutptTxt("[AntiNukeCoverage] target-search entry did not match; circular coverage fix skipped");
+	}
+	if (memcmp(reinterpret_cast<const void*>(AntiNukeMinimapCoverageAdjustAddr),
+		AntiNukeMinimapCoverageAdjustExpected, sizeof(AntiNukeMinimapCoverageAdjustExpected)) == 0)
+	{
+		m_hooks.push_back(std::make_unique<SingleHook>(AntiNukeMinimapCoverageAdjustAddr,
+			sizeof(AntiNukeMinimapCoverageAdjustPatch), INLINE_UNPROTECTEVINMENT,
+			AntiNukeMinimapCoverageAdjustPatch));
+	}
+	else
+	{
+		IDDrawSurface::OutptTxt("[AntiNukeCoverage] minimap radius adjustment did not match; minimap coverage fix skipped");
+	}
 	// Redirect the cmalloc_comt CALL at 0x42dd74 to ZeroingDownloadMenuAlloc (see comment at its definition).
 	ZeroDownloadMenuCallPatch[0] = 0xE8;
 	*(DWORD*)(ZeroDownloadMenuCallPatch + 1) = (DWORD)((BYTE*)&ZeroingDownloadMenuAlloc - (0x42dd74 + 5));

@@ -8,7 +8,9 @@
 #include "tafunctions.h"
 #include "tamem.h"
 #include "UnitDefExtensions.h"
+#include "TAbugfix.h"
 #include "ShareGuard.h"
+#include "ShareUnitSettings.h"
 #include "Profiler.h"
 #include "config.h"
 
@@ -490,12 +492,24 @@ __declspec(naked) static void DrawBuildSpotQueueReturnThunk()
 static DWORD g_createFromNetworkRealReturn = 0;
 static BYTE* g_createFromNetworkSpawnRecord = nullptr;
 
+// Re-entrancy accounting -- OBSERVE ONLY, behaviour unchanged. Same single-save-slot shape as the
+// Order_MobileBuild envelope below and the same risk: re-entry overwrites both globals, so the
+// OUTER thunk jumps to the INNER caller and applies the WRONG spawn record. Added while chasing
+// the 2026-09-08 AV in UNITS_Send_UnitDeath_P0C, whose breadcrumb ring held a record naming slot
+// 38128 of a 15,000 slot array. Zero hits so far, which is itself evidence.
+static int      g_cfnDepth = 0;
+static unsigned g_cfnReentries = 0;
+
 // Receive-side: copy heading from the packet onto the freshly created unit.
 // Only acts on buildings (bmcode==0); for mobile units the engine already
 // sets heading=nBuildAngle, and applying jittered values from the packet
 // would change long-standing behaviour for unrotated mobile spawns.
 extern "C" void __cdecl ApplyHeadingFromSpawnRecord(BYTE* spawnRecord, BYTE* pUnit)
 {
+    // The thunk calls this exactly once per envelope, unconditionally, so decrementing here
+    // pairs with the entry increment even though the guards below return early.
+    if (g_cfnDepth > 0) --g_cfnDepth;
+
     if (!spawnRecord || !pUnit) return;
     WORD unitInfoId = *reinterpret_cast<WORD*>(pUnit + OFF_UNIT_UnitINFOID);
     if (unitInfoId == 0) return;
@@ -527,20 +541,69 @@ __declspec(naked) static void CreateFromNetworkReturnThunk()
 }
 
 // ---- Order_MobileBuild / Order_VTOL_MobileBuild pre/post state ----
-// One save slot is enough — Order_MobileBuild does not recurse into itself
-// (and Order_VTOL_MobileBuild can't be on the stack while Order_MobileBuild
-// is, or vice versa, because the per-builder dispatch picks one or the other).
+// This envelope hijacks the function's return address. Order_MobileBuild CAN be
+// re-entered: ConstructionKickout's hook at 0x00403CD0 cancels another unit's
+// build order from inside the handler, and UnitScriptingData_CancelOrder
+// re-dispatches that order (0x0043A21A) with flags=2. A single save slot then
+// sends the OUTER return to the INNER caller, on the outer frame's stack.
+//
+// That is the confirmed cause of the 2026-09-14 ProTA crash (report "venom"):
+// the outer call returned to 0x0043A21E instead of 0x0043B880, ran
+// UnitScriptingData_CancelOrder's tail on MainOrderStateController's frame, and
+// its 3-POP epilogue RETed into MainOrderStateController's saved EBX —
+// dynmem+0x14353, a data address. Needs BOTH orders rotated; an unrotated call
+// arms nothing. Full write-up in the resolve-tdraw-crashtrace skill.
+//
+// Depth accounting is always active (MBRE breadcrumb + tdrawlog line). Whether
+// we survive is compile-time: 1 = pop the outer return back (thunks unwind
+// strictly LIFO, so the popped entry is always the right one); 0 = the shipped
+// bug, kept only for deliberate reproduction.
+#define TDRAW_UNITROTATE_RETURN_STACK 1
+
+static const int kOmbMaxDepth = 8;
+
+// One entry per ARMED envelope. unitTypeIdx == 0 means the frame installed no
+// UNITINFO swap — it armed only to restore the parent's on exit.
+struct OmbFrame
+{
+    DWORD    retAddr;
+    unsigned unitTypeIdx;
+    int      rotation;
+};
+static OmbFrame g_ombStack[kOmbMaxDepth];
+static int      g_ombDepth = 0;
+// The slot the naked thunk jmps through.
 static DWORD g_orderMobileBuildRealReturn = 0;
-static bool  g_orderMobileBuildSwapActive = false;
 
 static void OrderMobileBuildPostSwap()
 {
-    if (!g_orderMobileBuildSwapActive) return;
-    g_orderMobileBuildSwapActive = false;
-    if (CUnitRotate* self = CUnitRotate::GetInstance())
+    if (g_ombDepth <= 0) return;   // nothing armed — nothing to unwind
+
+    const OmbFrame frame = g_ombStack[--g_ombDepth];
+#if TDRAW_UNITROTATE_RETURN_STACK
+    g_orderMobileBuildRealReturn = frame.retAddr;
+#else
+    (void)frame;    // observe-only: leave the single slot as the bug leaves it
+#endif
+
+    CUnitRotate* self = CUnitRotate::GetInstance();
+    if (!self) return;
+
+    self->ClearRotation();
+    self->ClearYardmapRotation();
+
+    // Give the PARENT envelope its swap back: the entry hook clears UNITINFO on
+    // the way in, so without this the rest of the outer Order_MobileBuild runs
+    // unrotated (the intermittent "staircase yardmap"). Apply*/Clear* track their
+    // own active idx, so re-applying a matching state is free.
+    if (g_ombDepth > 0)
     {
-        self->ClearRotation();
-        self->ClearYardmapRotation();
+        const OmbFrame& parent = g_ombStack[g_ombDepth - 1];
+        if (parent.unitTypeIdx != 0)
+        {
+            self->ApplyRotationTo(parent.unitTypeIdx, parent.rotation);
+            self->ApplyYardmapRotationTo(parent.unitTypeIdx, parent.rotation);
+        }
     }
 }
 
@@ -614,14 +677,26 @@ __declspec(naked) static void CreateUnitReturnThunk()
 // Clears a pending rotation the entry hook armed when the function takes a
 // branch that never reaches UNITS_CreateUnit (watcher broadcast path, early
 // validation bail-outs). GiveUnit is __stdcall void RET 0xC.
-static DWORD g_giveUnitRealReturn = 0;
+extern "C" DWORD __cdecl GiveUnitEnvelopeCleanup()
+{
+    g_pendingCreateRotation = -1;
+    return ShareUnitSettings::EndGive();
+}
 
 __declspec(naked) static void GiveUnitReturnThunk()
 {
     __asm
     {
-        mov dword ptr [g_pendingCreateRotation], -1
-        jmp dword ptr [g_giveUnitRealReturn]
+        // Reserve a return-address slot, then preserve all registers/flags.
+        // EndGive returns the caller saved before any entry redirection.
+        push 0
+        pushfd
+        pushad
+        call GiveUnitEnvelopeCleanup
+        mov dword ptr [esp + 0x24], eax
+        popad
+        popfd
+        ret
     }
 }
 
@@ -856,6 +931,28 @@ static int __stdcall SendNewUnitsP09_Entry_Proc(PInlineX86StackBuffer X86StrackB
 static int __stdcall CreateFromNetwork_Entry_Proc(PInlineX86StackBuffer X86StrackBuffer)
 {
     DWORD* stackTop = reinterpret_cast<DWORD*>(X86StrackBuffer->Esp);
+
+    // Report BEFORE clobbering, so the record shows exactly what is being lost. Note stackTop[0]
+    // is already &CreateFromNetworkReturnThunk on a re-entry -- the outer call installed it -- so
+    // a thunk address here is itself the signature of recursion.
+    if (g_cfnDepth > 0)
+    {
+        ++g_cfnReentries;
+        CrashTrace_RecordEvent(TRACE_CAT_CFNR,
+                               static_cast<DWORD>(g_cfnDepth),
+                               g_createFromNetworkRealReturn,
+                               reinterpret_cast<DWORD>(g_createFromNetworkSpawnRecord),
+                               stackTop[2]);
+        IDDrawSurface::OutptFmtTxt(
+            "[CUnitRotate] CreateFromNetwork RE-ENTERED depth=%d n=%u: outer ret=%08X record=%08X "
+            "being replaced by ret=%08X record=%08X",
+            g_cfnDepth, g_cfnReentries,
+            g_createFromNetworkRealReturn,
+            reinterpret_cast<DWORD>(g_createFromNetworkSpawnRecord),
+            stackTop[0], stackTop[2]);
+    }
+    ++g_cfnDepth;
+
     g_createFromNetworkSpawnRecord = reinterpret_cast<BYTE*>(stackTop[2]);  // arg2
     g_createFromNetworkRealReturn  = stackTop[0];
     stackTop[0] = reinterpret_cast<DWORD>(&CreateFromNetworkReturnThunk);
@@ -935,6 +1032,10 @@ static int __stdcall OrderMobileBuild_Entry_Proc(PInlineX86StackBuffer X86Strack
     BYTE* order = reinterpret_cast<BYTE*>(stackTop[2]);
     if (!order) return 0;
 
+    // A nested call must arm a thunk even if it installs no swap of its own —
+    // that is the only way the parent's UNITINFO state comes back.
+    const bool reentrant = (g_ombDepth > 0);
+
     // Clear any stale UNITINFO swap from _TestBuildSpot's cursor preview
     // BEFORE the engine reads UNITINFO this tick. Without this, an unrotated
     // builder order completing while the player has a rotated cursor preview
@@ -948,32 +1049,87 @@ static int __stdcall OrderMobileBuild_Entry_Proc(PInlineX86StackBuffer X86Strack
     self->ClearRotation();
     self->ClearYardmapRotation();
 
+    // What THIS call wants installed; 0 = nothing. Same gates as ever, just
+    // collected rather than returned on, so a nested call still reaches the arm.
+    //
     // TakeOrderRotation is a peek — entry never erases. The map entry must
     // outlive every per-tick Order_MobileBuild call until the order
     // completes / is cancelled (DrawBuildSpotQueue still reads it).
-    int rotation = self->TakeOrderRotation(order);
-    if (rotation == 0) return 0;  // clean UNITINFO is what we want — done
+    unsigned swapUnitTypeIdx = 0;
+    int      swapRotation    = 0;
 
-    unsigned unitTypeIdx = *reinterpret_cast<unsigned*>(order + OFF_ORDER_build_unitType);
-    if (unitTypeIdx == 0) return 0;
+    const int rotation = self->TakeOrderRotation(order);
+    if (rotation != 0)
+    {
+        const unsigned unitTypeIdx =
+            *reinterpret_cast<unsigned*>(order + OFF_ORDER_build_unitType);
+        BYTE* ui = unitTypeIdx ? GetUnitInfoRaw(unitTypeIdx) : nullptr;
+        // bmcode != 0 = mobile target, nothing to swap. IsRotationAllowed also
+        // rejects stale entries from a freed-and-reused order address.
+        if (ui && *(ui + OFF_UNITINFO_bmcode) == 0 &&
+            self->IsRotationAllowed(unitTypeIdx, rotation))
+        {
+            swapUnitTypeIdx = unitTypeIdx;
+            swapRotation    = rotation;
+        }
+    }
 
-    BYTE* ui = GetUnitInfoRaw(unitTypeIdx);
-    if (!ui) return 0;
-    if (*(ui + OFF_UNITINFO_bmcode) != 0) return 0;  // mobile build target — no footprint to swap
+    // Nothing to install, nothing to restore — clean UNITINFO is what we want,
+    // and the per-tick happy path stays one hash lookup as before.
+    if (swapUnitTypeIdx == 0 && !reentrant) return 0;
 
-    // Defensive: ignore stale entries from a freed-and-reused order address.
-    if (!self->IsRotationAllowed(unitTypeIdx, rotation)) return 0;
+    // Envelope depth check BEFORE the swap is installed — bailing out after
+    // ApplyRotationTo would leave UNITINFO swapped with no thunk to clear it.
+    if (g_ombDepth >= kOmbMaxDepth)
+    {
+        CrashTrace_RecordEvent(TRACE_CAT_MBRE, stackTop[1], reinterpret_cast<DWORD>(order),
+                               static_cast<DWORD>(g_ombDepth),
+                               g_ombStack[kOmbMaxDepth - 1].retAddr);
+        IDDrawSurface::OutptFmtTxt(
+            "[CUnitRotate] Order_MobileBuild envelope depth limit (%d) hit on unit %08X "
+            "order %08X — not arming (rotation swap skipped for this call)",
+            kOmbMaxDepth, stackTop[1], reinterpret_cast<DWORD>(order));
+        return 0;
+    }
 
     // Install footprint + yardmap swap. The (idx, rotation) overload drives
     // needSwap from the explicit order rotation without touching m_rotation
     // (and without printing "Build facing: …" — this hook fires per tick).
-    self->ApplyRotationTo(unitTypeIdx, rotation);
-    self->ApplyYardmapRotationTo(unitTypeIdx, rotation);
+    if (swapUnitTypeIdx != 0)
+    {
+        self->ApplyRotationTo(swapUnitTypeIdx, swapRotation);
+        self->ApplyYardmapRotationTo(swapUnitTypeIdx, swapRotation);
+    }
 
-    // Arm the return thunk to clear the swap on function exit.
-    g_orderMobileBuildSwapActive = true;
-    g_orderMobileBuildRealReturn = stackTop[0];
+    // Arm the return thunk: restores this frame's return address, clears its
+    // swap, re-installs the parent's.
+    OmbFrame& frame = g_ombStack[g_ombDepth++];
+    frame.retAddr     = stackTop[0];
+    frame.unitTypeIdx = swapUnitTypeIdx;
+    frame.rotation    = swapRotation;
+    g_orderMobileBuildRealReturn = frame.retAddr;
     stackTop[0] = reinterpret_cast<DWORD>(&OrderMobileBuildReturnThunk);
+
+    if (reentrant)
+    {
+        // The condition the single-slot design could not survive. Still logged
+        // unconditionally now that it is survivable — the depth trace is what
+        // identified this crash family.
+        CrashTrace_RecordEvent(TRACE_CAT_MBRE, stackTop[1], reinterpret_cast<DWORD>(order),
+                               static_cast<DWORD>(g_ombDepth),
+                               g_ombStack[g_ombDepth - 2].retAddr);
+        IDDrawSurface::OutptFmtTxt(
+            "[CUnitRotate] RE-ENTRANT Order_MobileBuild envelope: depth=%d unit=%08X "
+            "order=%08X rot=%d innerRet=%08X outerRet=%08X (return stack %s)",
+            g_ombDepth, stackTop[1], reinterpret_cast<DWORD>(order), swapRotation,
+            g_ombStack[g_ombDepth - 1].retAddr, g_ombStack[g_ombDepth - 2].retAddr,
+            TDRAW_UNITROTATE_RETURN_STACK ? "ACTIVE — survivable" : "DISABLED — will crash");
+    }
+    else
+    {
+        CrashTrace_RecordEvent(TRACE_CAT_MBLD, stackTop[1], reinterpret_cast<DWORD>(order),
+                               static_cast<DWORD>(g_ombDepth), g_orderMobileBuildRealReturn);
+    }
     return 0;
 }
 
@@ -1114,6 +1270,12 @@ static int __stdcall GiveUnit_Entry_Proc(PInlineX86StackBuffer X86StrackBuffer)
     }
 #endif
 
+    // Record the real share/capture caller for ALL units, including mobiles,
+    // before rotation can replace the return address. Suppressed/delayed calls
+    // above never arm an envelope; their later accepted re-issue does.
+    ShareUnitSettings::BeginGive(stackTop[0]);
+    stackTop[0] = reinterpret_cast<DWORD>(&GiveUnitReturnThunk);
+
     WORD unitTypeIdx = *reinterpret_cast<WORD*>(srcUnit + OFF_UNIT_UnitINFOID);
     if (unitTypeIdx == 0) return 0;
     BYTE* ui = GetUnitInfoRaw(unitTypeIdx);
@@ -1128,8 +1290,6 @@ static int __stdcall GiveUnit_Entry_Proc(PInlineX86StackBuffer X86StrackBuffer)
     if (!self->IsRotationAllowed(unitTypeIdx, rotation)) return 0;
 
     g_pendingCreateRotation = rotation;
-    g_giveUnitRealReturn = stackTop[0];
-    stackTop[0] = reinterpret_cast<DWORD>(&GiveUnitReturnThunk);
     return 0;
 }
 

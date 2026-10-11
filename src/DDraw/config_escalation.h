@@ -25,6 +25,16 @@
 #define TAKE_CLAIM_ENABLE 1
 
 //
+// Lag-switch mitigation
+//
+// Freezes the local simulation while every remote peer is silent, so a player
+// pulling the plug on his own connection cannot manoeuvre while immune to
+// incoming damage.  Purely local -- it only suppresses this client's own sim
+// ticks, so it neither desyncs nor changes the wire protocol.  It does,
+// however, stall the game on ordinary packet loss too.  See LagSwitchGuard.h.
+#define LAG_SWITCH_GUARD_ENABLE 1
+
+//
 // Construction / AI behavior
 //
 #define FIXED_POSN_GUARDING_CONS_ENABLE 1
@@ -71,18 +81,45 @@
 #define AIR_CORPSE_FALL_ENABLE 1
 
 //
+// COB script VM -- opcode dispatch
+//
+// Replaces the 28-node compare-ladder opcode dispatch with a 256-entry jump
+// table. Class A (bit-identical, purely faster). Full derivation, status and
+// test results: ai-reference/simulation-performance/COB_DISPATCH_PROJECT.md
+// and CLAUDE.md. Verify the static case against the binary with
+// ai-reference/tools/exe/cob_dispatch.py --verify.
+//
+// Escalation-only by construction -- the splice window and all 57 hardcoded
+// addresses belong to Escalation GOLD 10.1/10.2's TotalA.exe specifically.
+// config.h defaults this to 0 everywhere else.
+#define COB_DISPATCH_TABLE_ENABLE 1
+
+//
+// BuildWeaponSlotGuard -- fixes the stockpile-weapon build-percent divide-by-zero
+// crash (real cause, corrected 2026-09-14: unit-identity divergence resolving a
+// weapon slot to WeaponsTypedefArray[0], TA's zero-divisor "no weapon" sentinel --
+// see BuildWeaponSlotGuard.h), plus a bounds check on the adjacent unchecked
+// weapon-slot index. See BuildWeaponSlotGuard.h for the full derivation and evidence.
+//
+// Gated to Escalation because this project has verified these addresses against
+// Escalation's TotalA.exe alone -- not because the addresses are believed unique to
+// it (PR #26's review found them byte-identical on all seven shipped TotalA.exe
+// builds; this project has not re-run that check itself). config.h defaults this to
+// 0 everywhere else. Active by default here: this is a fix, not a diagnostic -- both
+// the reload-divisor clamp (Class A: only touches weapons that are already
+// degenerate, bit-identical otherwise) and the weapon-slot bounds check (Class B, but
+// the DLL ships with a new game version, so there is no mixed-client-version fleet to
+// keep in lockstep) are meant to be on for every player, not staged behind further
+// review.
+#define BUILD_WEAPON_SLOT_GUARD_ENABLE 1
+
+//
 // Extended weapon IDs (>= 256)
 //
 // Installs WeaponIdOverflow (heap-backed weapon slots above TA's hard-coded
 // Weapons[256]) plus WeaponFiredExt (the CHAT_05-hijack packet that carries
 // fire events for those overflow IDs, which the native WEAPON_FIRED_0D byte ID
 // cannot address).  See config.h for the full description.
-//
-// Escalation only, as the designated rollout target for the feature: no other
-// config needs weapon IDs past 255 yet, and WeaponFiredExt changes what goes
-// on the wire, so every player in a game must agree on the setting.  Hence
-// compile-time only -- a runtime switch would be a mixed-fleet vector.  Other
-// configs keep the config.h default of 0.
 #define TDRAW_EXTENDED_WEAPON_IDS 1
 
 //
@@ -114,6 +151,20 @@
 #define USEWHITEBOARD 1
 
 //
+// Allied build-queue overlay -- see AlliedBuildQueueSync.h, and config.h for
+// the full description.  Draws allies' queued build placements (game screen
+// while SHIFT is held with an allied builder under the cursor/camera, and the
+// megamap) and broadcasts the local player's own queue to allies on
+// CHAT_05-hijack msgId 0x60.  Off: nothing is hooked, sent, parsed or drawn,
+// and the "Show ally queues" dialog checkbox is not created.
+#define ALLIED_BUILD_QUEUE_ENABLE 0
+
+// PlayerMute: local `.mute` / `.unmute` -- see config.h.  Display-only and cannot
+// desync; both splice sites are byte-checked at static-init time and the feature
+// disables itself (logged) if the exe does not match, so it ships on every config.
+#define PLAYER_MUTE_ENABLE 1
+
+//
 // Air-unit stacking / area-damage immunity -- see AreaDamageOverflow.h.
 // Lets one explosion damage every airborne unit on a cell instead of only the one
 // holding the cell's air slot. Air-only; ground/naval splash is unchanged.
@@ -131,3 +182,24 @@
 // type on both layers, not just aircraft. Class B patch.
 #define GRID_CLAIM_TIEBREAK_ENABLE 1
 
+//
+// Percentage-based resource share thresholds -- see SharePercent.h and config.h for
+// the full description. Purely local per-client state; not a Class B patch, does not
+// require every player to run the same build.
+#define SHARE_PERCENT_ENABLE 1
+
+// Ground-to-air Guard -- see GroundToAirGuard.h. Lets a ground CanGuard unit guard a
+// flying ally (e.g. a ground constructor assisting an air constructor's build),
+// reachable only via the explicit Guard command. Class B: changes which orders can be
+// constructed and what the simulation does with one, so every client must run the
+// same build. Active by default here, same rationale as BuildWeaponSlotGuard above:
+// this is a feature this config ships with, not a diagnostic staged behind review.
+#define GROUND_TO_AIR_GUARD_ENABLE 1
+
+// VtolRepairBeamFix -- see VtolRepairBeamFix.h. On: a stalled air constructor stops
+// showing the nanolathe beam, which is what every ground repair tick already does.
+#define VTOL_REPAIR_BEAM_FIX_ENABLE 1
+
+// Per-player patrol reclaim thresholds and the air-constructor gate; see PatrolReclaimThreshold.h.
+#define PATROL_RECLAIM_THRESHOLD_ENABLE 1
+#define PATROL_RECLAIM_AIR_GATE_ENABLE 1
